@@ -8,7 +8,7 @@ back out with a small delay.
 
 No STT, no Claude, no TTS yet. That comes in later steps.
 
-Optionally reads MIC_DEVICE_INDEX / SPEAKER_DEVICE_INDEX from .env (see
+Optionally reads MIC_DEVICE_NAME / SPEAKER_DEVICE_NAME from .env (see
 list_audio_devices.py) to test specific hardware instead of the system
 default mic/speaker. Handy for sanity-checking one new piece of hardware
 (e.g. a speaker) before the rest of the setup (e.g. a mic) arrives.
@@ -32,6 +32,8 @@ from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.workers.runner import WorkerRunner
+
+from audio_devices import find_device_index
 
 load_dotenv()
 
@@ -60,8 +62,8 @@ class LoopbackProcessor(FrameProcessor):
 
 
 async def main():
-    mic_index = os.environ.get("MIC_DEVICE_INDEX")
-    speaker_index = os.environ.get("SPEAKER_DEVICE_INDEX")
+    mic_name = os.environ.get("MIC_DEVICE_NAME")
+    speaker_name = os.environ.get("SPEAKER_DEVICE_NAME")
 
     transport = LocalAudioTransport(
         LocalAudioTransportParams(
@@ -72,10 +74,13 @@ async def main():
             # unchanged, so a mismatch here speeds up and pitch-shifts it.
             audio_in_sample_rate=16000,
             audio_out_sample_rate=16000,
-            # Optional MIC_DEVICE_INDEX / SPEAKER_DEVICE_INDEX from .env, from
-            # list_audio_devices.py. Unset uses the system default device.
-            input_device_index=int(mic_index) if mic_index else None,
-            output_device_index=int(speaker_index) if speaker_index else None,
+            # Optional MIC_DEVICE_NAME / SPEAKER_DEVICE_NAME from .env, matched
+            # by substring against list_audio_devices.py. Unset uses the
+            # system default device.
+            input_device_index=find_device_index(mic_name, want_input=True) if mic_name else None,
+            output_device_index=(
+                find_device_index(speaker_name, want_input=False) if speaker_name else None
+            ),
         )
     )
 

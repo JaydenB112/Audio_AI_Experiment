@@ -29,6 +29,7 @@ Stop with Ctrl+C.
 import asyncio
 import os
 import sys
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -41,6 +42,7 @@ from pipecat.frames.frames import (
     InterruptionFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    LLMRunFrame,
     LLMTextFrame,
     UserStartedSpeakingFrame,
 )
@@ -57,6 +59,8 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.workers.runner import WorkerRunner
+
+from audio_devices import find_device_index
 
 load_dotenv()
 
@@ -471,11 +475,16 @@ class InterruptionMonitor(FrameProcessor):
     the LLM and TTS stages so it sees UserStartedSpeakingFrame flowing
     downstream from the VAD-driven aggregator, and BotStartedSpeakingFrame /
     BotStoppedSpeakingFrame flowing upstream from the transport output.
+
+    Also exposes wait_for_bot_stopped(), used to hold off ending a session
+    until a triggered announcement (greeting, farewell) has actually
+    finished being spoken, not just been queued.
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._bot_speaking = False
+        self._bot_stopped_event = asyncio.Event()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -486,6 +495,7 @@ class InterruptionMonitor(FrameProcessor):
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
             logger.info("[state] bot stopped speaking")
+            self._bot_stopped_event.set()
         elif isinstance(frame, UserStartedSpeakingFrame):
             if self._bot_speaking:
                 logger.warning("[state] user started speaking while bot was talking, interruption")
@@ -495,6 +505,25 @@ class InterruptionMonitor(FrameProcessor):
             logger.warning("[state] interruption frame pushed")
 
         await self.push_frame(frame, direction)
+
+    def reset_bot_stopped_event(self) -> None:
+        """Clear any stale stopped-speaking signal from earlier in the
+        conversation. Call this immediately before triggering a new
+        announcement, so wait_for_bot_stopped() waits for *that*
+        announcement to finish rather than returning instantly on a stale
+        signal from a previous turn.
+        """
+        self._bot_stopped_event.clear()
+
+    async def wait_for_bot_stopped(self, timeout: float = 15.0) -> None:
+        """Wait until the bot stops speaking, or until timeout elapses.
+        Times out silently rather than raising, since a slow/missing
+        response here shouldn't block the state machine indefinitely.
+        """
+        try:
+            await asyncio.wait_for(self._bot_stopped_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"[state] wait_for_bot_stopped timed out after {timeout}s")
 
 
 def check_required_env() -> None:
@@ -520,14 +549,15 @@ def build_local_transport() -> LocalAudioTransport:
     on cleanup, only its audio streams. Building a fresh transport per
     conversation would leak a PyAudio instance every time.
 
-    Reads MIC_DEVICE_INDEX and SPEAKER_DEVICE_INDEX from the environment if
+    Reads MIC_DEVICE_NAME and SPEAKER_DEVICE_NAME from the environment if
     set, letting the mic and speaker be two different physical devices
-    (e.g. two separate Bluetooth peripherals) instead of both defaulting to
-    the system's default audio device. Find the indices with
-    list_audio_devices.py after pairing/connecting the hardware.
+    (e.g. two separate peripherals) instead of both defaulting to the
+    system's default audio device. Matched by name substring, not raw
+    index, since device indices shift whenever hardware is plugged or
+    unplugged. Run list_audio_devices.py to see current device names.
     """
-    mic_index = os.environ.get("MIC_DEVICE_INDEX")
-    speaker_index = os.environ.get("SPEAKER_DEVICE_INDEX")
+    mic_name = os.environ.get("MIC_DEVICE_NAME")
+    speaker_name = os.environ.get("SPEAKER_DEVICE_NAME")
 
     return LocalAudioTransport(
         LocalAudioTransportParams(
@@ -535,15 +565,32 @@ def build_local_transport() -> LocalAudioTransport:
             audio_out_enabled=True,
             audio_in_sample_rate=SAMPLE_RATE,
             audio_out_sample_rate=SAMPLE_RATE,
-            input_device_index=int(mic_index) if mic_index else None,
-            output_device_index=int(speaker_index) if speaker_index else None,
+            input_device_index=(
+                find_device_index(mic_name, want_input=True) if mic_name else None
+            ),
+            output_device_index=(
+                find_device_index(speaker_name, want_input=False) if speaker_name else None
+            ),
         )
     )
 
 
+@dataclass
+class SentinelSession:
+    """Everything a conversation needs beyond the worker itself: the LLM
+    context (to seed a stage-direction cue) and the InterruptionMonitor
+    (to know when a triggered cue has finished being spoken), for use with
+    announce() below.
+    """
+
+    worker: PipelineWorker
+    context: LLMContext
+    monitor: InterruptionMonitor
+
+
 def build_sentinel_worker(
     transport: LocalAudioTransport, voice_id: str | None = None
-) -> PipelineWorker:
+) -> SentinelSession:
     """Build a fresh Sentinel pipeline and worker around the given transport.
     Call this once per conversation, unlike the transport itself, which
     should be built once and passed in on every call.
@@ -583,6 +630,8 @@ def build_sentinel_worker(
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
+    monitor = InterruptionMonitor()
+
     pipeline = Pipeline(
         [
             transport.input(),
@@ -590,29 +639,64 @@ def build_sentinel_worker(
             user_aggregator,
             llm,
             ResponsePrinter(),
-            InterruptionMonitor(),
+            monitor,
             tts,
             transport.output(),
             assistant_aggregator,
         ]
     )
 
-    return PipelineWorker(pipeline, params=PipelineParams())
+    worker = PipelineWorker(pipeline, params=PipelineParams())
+    return SentinelSession(worker=worker, context=context, monitor=monitor)
+
+
+GREETING_CUE = (
+    "(A traveler has just come within range and is standing in front of "
+    "you. Address them now, in character, without waiting for them to "
+    "speak first.)"
+)
+
+DEPARTURE_CUE = (
+    "(The traveler is leaving and will no longer be able to hear you. "
+    "Acknowledge their departure briefly, in character, then fall silent.)"
+)
+
+
+async def announce(session: SentinelSession, cue: str, timeout: float = 15.0) -> None:
+    """Seed a stage-direction cue into the conversation and trigger Claude
+    to respond immediately, without waiting for real user speech, then
+    wait until that response has actually finished being spoken (or
+    timeout) before returning. Used for the opening greeting and the
+    departure acknowledgment.
+    """
+    session.monitor.reset_bot_stopped_event()
+    session.context.add_message({"role": "user", "content": cue})
+    await session.worker.queue_frames([LLMRunFrame()])
+    await session.monitor.wait_for_bot_stopped(timeout=timeout)
 
 
 async def main():
     check_required_env()
 
     transport = build_local_transport()
-    worker = build_sentinel_worker(transport)
+    session = build_sentinel_worker(transport)
 
     runner = WorkerRunner()
-    await runner.add_workers(worker)
+    await runner.add_workers(session.worker)
+
+    # add_workers() only registers the worker -- the pipeline doesn't
+    # actually start running until runner.run() is awaited. Start that as a
+    # background task before announce() queues the greeting, or the
+    # greeting sits in an unstarted pipeline's queue until announce()'s own
+    # wait times out.
+    run_task = asyncio.create_task(runner.run())
 
     logger.info("SENTINEL ONLINE.")
     logger.info("Press Ctrl+C to stop.")
 
-    await runner.run()
+    await announce(session, GREETING_CUE)
+
+    await run_task
 
 
 if __name__ == "__main__":
