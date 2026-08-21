@@ -1,0 +1,146 @@
+"""
+Step 8: presence-triggered state machine.
+
+Wraps the Sentinel pipeline from step7_sentinel.py in a wake/sleep cycle
+driven by a presence sensor, instead of running continuously. This is the
+shape the real robot needs: idle and silent until someone approaches,
+converse, then return to idle once they leave.
+
+State flow:
+    SLEEPING -> (presence detected) -> AWAKENING -> conversation running
+    -> (presence lost for DEPARTURE_GRACE_SECONDS, or the conversation ends
+    on its own) -> COOLDOWN -> back to SLEEPING
+
+One LocalAudioTransport is built once and reused across every conversation
+rather than rebuilt per visitor. Pipecat's LocalAudioTransport never
+releases its underlying PyAudio host handle on cleanup, only its audio
+streams, so rebuilding it per conversation would leak a PyAudio instance
+every single visitor, which matters once this runs unattended for days.
+
+Uses the real motion sensor via KeystrokePresenceSensor (presence_sensor.py)
+-- it's a USB device that emulates a keyboard, sending 't' (talk, start the
+conversation), 'q' (quit, end it), or 'r' (recognize, logged but not acted
+on yet). ConsolePresenceSensor (press Enter to simulate arrival/departure)
+is still in presence_sensor.py if you need to test the state machine
+without the sensor plugged in -- swap it back in below for that.
+
+Requires headphones, same reason as step 4.
+
+Requires DEEPGRAM_API_KEY, ANTHROPIC_API_KEY, and ELEVENLABS_API_KEY in a
+.env file (see .env.example).
+
+Run:
+    python step8_presence.py
+
+Stop with Ctrl+C.
+"""
+
+import asyncio
+import sys
+
+from dotenv import load_dotenv
+from loguru import logger
+
+from pipecat.pipeline.worker import PipelineWorker
+from pipecat.workers.runner import WorkerRunner
+from presence_sensor import KeystrokePresenceSensor, PresenceSensor
+from step7_sentinel import build_local_transport, build_sentinel_worker, check_required_env
+
+load_dotenv()
+
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+
+DEPARTURE_GRACE_SECONDS = 15.0
+COOLDOWN_SECONDS = 10.0
+DEPARTURE_POLL_SECONDS = 1.0
+
+
+async def watch_for_departure(sensor: PresenceSensor, worker: PipelineWorker) -> None:
+    """Poll the sensor while a conversation is running. Once it reports
+    absence continuously for DEPARTURE_GRACE_SECONDS, tell the worker to
+    end gracefully and return. A brief step away from the sensor doesn't
+    end the conversation, only a sustained absence does.
+    """
+    absent_since: float | None = None
+    loop = asyncio.get_running_loop()
+
+    while True:
+        await asyncio.sleep(DEPARTURE_POLL_SECONDS)
+
+        if sensor.is_present():
+            absent_since = None
+            continue
+
+        if absent_since is None:
+            absent_since = loop.time()
+            continue
+
+        if loop.time() - absent_since >= DEPARTURE_GRACE_SECONDS:
+            logger.info("[state] presence lost, ending conversation")
+            await worker.stop_when_done()
+            return
+
+
+async def run_conversation(sensor: PresenceSensor, transport) -> None:
+    """Run one full conversation session against the shared transport:
+    build a fresh pipeline, run it until it ends, and clean up.
+    """
+    worker = build_sentinel_worker(transport)
+    runner = WorkerRunner()
+    await runner.add_workers(worker)
+
+    session_task = asyncio.create_task(runner.run())
+    departure_task = asyncio.create_task(watch_for_departure(sensor, worker))
+
+    done, _ = await asyncio.wait(
+        {session_task, departure_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if departure_task in done:
+        # Departure just queued an EndFrame. Let the session finish
+        # shutting down on its own, don't cancel it mid-cleanup.
+        await session_task
+    else:
+        # The conversation ended some other way. Stop watching for
+        # departure and surface anything session_task raised.
+        departure_task.cancel()
+        try:
+            await departure_task
+        except asyncio.CancelledError:
+            pass
+        await session_task
+
+
+async def run_state_machine(sensor: PresenceSensor) -> None:
+    transport = build_local_transport()
+
+    while True:
+        logger.info("[state] SLEEPING")
+        await sensor.wait_until_present()
+
+        logger.info("[state] AWAKENING")
+        await run_conversation(sensor, transport)
+
+        logger.info(f"[state] COOLDOWN ({COOLDOWN_SECONDS:.0f}s)")
+        await asyncio.sleep(COOLDOWN_SECONDS)
+
+
+async def main():
+    check_required_env()
+
+    sensor = KeystrokePresenceSensor()
+    logger.info(
+        "Listening for the motion sensor's keystrokes (t = talk/start, "
+        "q = quit/end, r = recognize/logged only). Requires this process "
+        "to have Input Monitoring permission on macOS."
+    )
+
+    await run_state_machine(sensor)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Stopped.")

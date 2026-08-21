@@ -1,0 +1,4 @@
+pipecat-ai[local,deepgram,anthropic,silero,elevenlabs]
+python-dotenv
+loguru
+pynput
