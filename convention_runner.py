@@ -1,7 +1,7 @@
-"""Run one fresh Step 8 process per convention visitor.
+"""Run one fresh step9_elevenlabs_agent process per convention visitor.
 
 This supervisor deliberately stays small: the child owns all audio, sensor,
-Pipecat, and API resources, then the operating system reclaims them when the
+and API resources, then the operating system reclaims them when the
 conversation ends. A failed child is restarted with bounded exponential
 backoff so a persistent hardware or configuration problem cannot create a
 tight restart loop.
@@ -18,7 +18,7 @@ from pathlib import Path
 
 from loguru import logger
 
-STEP8 = Path(__file__).with_name("step8_presence.py")
+CONVERSATION_STEP = Path(__file__).with_name("step9_elevenlabs_agent.py")
 NORMAL_RESTART_DELAY_SECONDS = 2.0
 MAX_FAILURE_BACKOFF_SECONDS = 60.0
 
@@ -28,7 +28,7 @@ async def run_convention() -> None:
 
     while True:
         logger.info("[supervisor] starting a fresh conversation process")
-        process = await asyncio.create_subprocess_exec(sys.executable, str(STEP8))
+        process = await asyncio.create_subprocess_exec(sys.executable, str(CONVERSATION_STEP))
 
         try:
             return_code = await process.wait()

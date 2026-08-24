@@ -3,3 +3,4 @@ python-dotenv
 loguru
 pynput
 pywebrtc-audio==0.1.0
+elevenlabs
