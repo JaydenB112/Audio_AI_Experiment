@@ -43,6 +43,17 @@ presence sensor's keystrokes only reach whichever tab has focus. To
 redeploy after editing `web/index.html`, run `vercel --prod --yes` from
 inside `web/` (linked to the `jaydenb112s-projects` Vercel scope).
 
+By default the page uses the browser/OS's default mic and speaker. To pin
+specific devices on a given machine (recommended whenever that machine has
+more than one mic or speaker), append `?mic=<name>&speaker=<name>` to the
+URL, e.g. `?mic=Logi&speaker=External` -- same case-insensitive substring
+matching as `MIC_DEVICE_NAME`/`SPEAKER_DEVICE_NAME` in `.env`. This is
+per-machine config carried in the link itself, not in the deployed code,
+since one static page serves every booth machine. Give each machine the
+exact link with its own params; a mismatched or unmatched name logs a
+warning to the browser console and falls back to the OS default rather
+than failing.
+
 The browser page has no local echo cancellation of its own -- it relies on
 the browser's built-in AEC (`getUserMedia({ audio: { echoCancellation:
 true } })`) instead of `aec.py`, and there's no process supervisor, so a

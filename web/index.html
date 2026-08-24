@@ -158,6 +158,51 @@
       });
     }
 
+    // Case-insensitive substring match against a device's label, the same
+    // matching rule find_device_index() in audio_devices.py uses for the
+    // native version. Device labels are only populated by the browser
+    // after permission has been granted at least once, so this must run
+    // after getUserMedia(), not before.
+    function matchDevice(devices, kind, nameSubstring) {
+      if (!nameSubstring) return undefined;
+      const needle = nameSubstring.toLowerCase();
+      const matches = devices.filter(
+        (d) => d.kind === kind && d.label.toLowerCase().includes(needle)
+      );
+      if (matches.length === 0) {
+        console.warn(
+          `[audio] no ${kind} device matching "${nameSubstring}" -- using the OS default`
+        );
+        return undefined;
+      }
+      if (matches.length > 1) {
+        console.warn(
+          `[audio] multiple ${kind} devices match "${nameSubstring}": ` +
+            matches.map((d) => d.label).join(", ") +
+            " -- using the first one. Use a more specific value in the URL."
+        );
+      }
+      return matches[0].deviceId;
+    }
+
+    // Reads ?mic=...&speaker=... from this page's own URL, so which
+    // devices to lock onto is set per machine by the link handed to that
+    // machine, without editing or redeploying this page. Omit either
+    // param to fall back to the OS default for that device, the same as
+    // leaving MIC_DEVICE_NAME/SPEAKER_DEVICE_NAME unset in .env.
+    async function resolveDeviceIds() {
+      const params = new URLSearchParams(window.location.search);
+      const micName = params.get("mic");
+      const speakerName = params.get("speaker");
+      if (!micName && !speakerName) return {};
+
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return {
+        inputDeviceId: matchDevice(devices, "audioinput", micName),
+        outputDeviceId: matchDevice(devices, "audiooutput", speakerName),
+      };
+    }
+
     async function startConversation() {
       setStatus("AWAKENING", "starting conversation");
 
@@ -171,9 +216,12 @@
         return;
       }
 
+      const deviceIds = await resolveDeviceIds();
+
       try {
         conversation = await Conversation.startSession({
           agentId: AGENT_ID,
+          ...deviceIds,
           onConnect: () => setStatus("LISTENING", "conversation connected", "active"),
           onDisconnect: () => {
             console.log("[state] session ended");
