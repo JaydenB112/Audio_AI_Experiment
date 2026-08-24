@@ -13,7 +13,8 @@ from Meridian command, which the spec already establishes). Response
 length was also tightened for voice, since the source spec doesn't assume
 a spoken interface.
 
-Requires headphones, same reason as step 4.
+Uses WebRTC AEC3 to remove the known speaker signal from microphone input,
+so it can run through speakers while preserving interruption handling.
 
 Requires DEEPGRAM_API_KEY, ANTHROPIC_API_KEY, and ELEVENLABS_API_KEY in a
 .env file (see .env.example). ELEVENLABS_VOICE_ID is optional, it defaults
@@ -60,6 +61,7 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
 from pipecat.workers.runner import WorkerRunner
 
+from aec import AECLocalAudioTransport, WebRTCAECFilter
 from audio_devices import find_device_index
 
 load_dotenv()
@@ -555,23 +557,30 @@ def build_local_transport() -> LocalAudioTransport:
     system's default audio device. Matched by name substring, not raw
     index, since device indices shift whenever hardware is plugged or
     unplugged. Run list_audio_devices.py to see current device names.
+
+    AEC_STREAM_DELAY_MS is an optional timing hint for WebRTC AEC3. Its
+    40 ms default matches Pipecat's default local-output chunk size.
     """
     mic_name = os.environ.get("MIC_DEVICE_NAME")
     speaker_name = os.environ.get("SPEAKER_DEVICE_NAME")
+    aec_stream_delay_ms = int(os.environ.get("AEC_STREAM_DELAY_MS", "40"))
+    aec_filter = WebRTCAECFilter(stream_delay_ms=aec_stream_delay_ms)
 
-    return LocalAudioTransport(
+    return AECLocalAudioTransport(
         LocalAudioTransportParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
             audio_in_sample_rate=SAMPLE_RATE,
             audio_out_sample_rate=SAMPLE_RATE,
+            audio_in_filter=aec_filter,
             input_device_index=(
                 find_device_index(mic_name, want_input=True) if mic_name else None
             ),
             output_device_index=(
                 find_device_index(speaker_name, want_input=False) if speaker_name else None
             ),
-        )
+        ),
+        aec_filter,
     )
 
 

@@ -1,21 +1,16 @@
 """
-Step 8: presence-triggered state machine.
+Step 8: one presence-triggered conversation.
 
-Wraps the Sentinel pipeline from step7_sentinel.py in a wake/sleep cycle
-driven by a presence sensor, instead of running continuously. This is the
-shape the real robot needs: idle and silent until someone approaches,
-converse, then return to idle once they leave.
+Waits for the presence sensor, runs one Sentinel conversation, then exits.
+Keeping each conversation in a fresh process ensures PyAudio, network
+clients, and DSP state are fully released between visitors. For unattended
+all-day operation, run convention_runner.py, which starts a fresh copy of
+this script after each conversation.
 
 State flow:
     SLEEPING -> (presence detected) -> AWAKENING -> conversation running
     -> (presence lost for DEPARTURE_GRACE_SECONDS, or the conversation ends
-    on its own) -> COOLDOWN -> back to SLEEPING
-
-One LocalAudioTransport is built once and reused across every conversation
-rather than rebuilt per visitor. Pipecat's LocalAudioTransport never
-releases its underlying PyAudio host handle on cleanup, only its audio
-streams, so rebuilding it per conversation would leak a PyAudio instance
-every single visitor, which matters once this runs unattended for days.
+    on its own) -> process exits
 
 Uses the real motion sensor via KeystrokePresenceSensor (presence_sensor.py)
 -- it's a USB device that emulates a keyboard, sending 't' (talk, start the
@@ -24,7 +19,8 @@ on yet). ConsolePresenceSensor (press Enter to simulate arrival/departure)
 is still in presence_sensor.py if you need to test the state machine
 without the sensor plugged in -- swap it back in below for that.
 
-Requires headphones, same reason as step 4.
+Uses WebRTC AEC3 to remove the known speaker signal from microphone input,
+so it can run through speakers while preserving interruption handling.
 
 Requires DEEPGRAM_API_KEY, ANTHROPIC_API_KEY, and ELEVENLABS_API_KEY in a
 .env file (see .env.example).
@@ -59,7 +55,6 @@ logger.remove()
 logger.add(sys.stderr, level="INFO")
 
 DEPARTURE_GRACE_SECONDS = 15.0
-COOLDOWN_SECONDS = 10.0
 DEPARTURE_POLL_SECONDS = 1.0
 
 
@@ -131,19 +126,15 @@ async def run_conversation(sensor: PresenceSensor, transport) -> None:
             pass
         await session_task
 
-
-async def run_state_machine(sensor: PresenceSensor) -> None:
+async def run_once(sensor: PresenceSensor) -> None:
     transport = build_local_transport()
 
-    while True:
-        logger.info("[state] SLEEPING")
-        await sensor.wait_until_present()
+    logger.info("[state] SLEEPING")
+    await sensor.wait_until_present()
 
-        logger.info("[state] AWAKENING")
-        await run_conversation(sensor, transport)
-
-        logger.info(f"[state] COOLDOWN ({COOLDOWN_SECONDS:.0f}s)")
-        await asyncio.sleep(COOLDOWN_SECONDS)
+    logger.info("[state] AWAKENING")
+    await run_conversation(sensor, transport)
+    logger.info("[state] conversation complete; exiting")
 
 
 async def main():
@@ -156,7 +147,7 @@ async def main():
         "to have Input Monitoring permission on macOS."
     )
 
-    await run_state_machine(sensor)
+    await run_once(sensor)
 
 
 if __name__ == "__main__":

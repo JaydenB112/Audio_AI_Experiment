@@ -2,3 +2,4 @@ pipecat-ai[local,deepgram,anthropic,silero,elevenlabs]
 python-dotenv
 loguru
 pynput
+pywebrtc-audio==0.1.0
