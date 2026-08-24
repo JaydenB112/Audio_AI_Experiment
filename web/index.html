@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MERIDIAN SENTINEL — Booth</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<style>
+  :root {
+    --bg: #0c1013;
+    --text: #edeff2;
+    --text-muted: #7c8794;
+    --accent: #4fd1c9;
+    --accent-dim: #2a5a56;
+    --error: #e2734e;
+    --font-sans: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", "SF Mono", Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: default;
+    user-select: none;
+  }
+
+  main {
+    text-align: center;
+    padding: 2rem;
+  }
+
+  .dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    margin: 0 auto 1.75rem;
+    transition: background 0.3s ease, box-shadow 0.3s ease;
+  }
+
+  .dot.active {
+    background: var(--accent);
+    box-shadow: 0 0 0 8px var(--accent-dim);
+  }
+
+  .dot.error {
+    background: var(--error);
+    box-shadow: 0 0 0 8px rgba(226, 115, 78, 0.25);
+  }
+
+  #status {
+    font-size: clamp(2.5rem, 8vw, 4.5rem);
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    margin: 0;
+  }
+
+  #detail {
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    font-size: 1rem;
+    margin-top: 0.75rem;
+    min-height: 1.4em;
+  }
+</style>
+</head>
+<body>
+  <main>
+    <div class="dot" id="dot"></div>
+    <p id="status">SLEEPING</p>
+    <p id="detail">waiting for a visitor</p>
+  </main>
+
+  <script type="module">
+    import { Conversation } from "https://esm.sh/@elevenlabs/client";
+
+    // Public agent (no auth) -- see MERIDIAN SENTINEL in the ElevenLabs
+    // dashboard. Safe to embed client-side: this is an identifier, not a
+    // secret, and the page URL isn't advertised anywhere.
+    const AGENT_ID = "agent_2401m05p8m0keqbrme5dam69n03r";
+
+    // Same values and cue text as step9_elevenlabs_agent.py, so this page
+    // behaves identically to the native version it stands in for.
+    const DEPARTURE_GRACE_MS = 15000;
+    const FAREWELL_TIMEOUT_MS = 15000;
+    const DEPARTURE_CUE =
+      "(The traveler is leaving and will no longer be able to hear you. " +
+      "Acknowledge their departure briefly, in character, then fall silent.)";
+
+    const dotEl = document.getElementById("dot");
+    const statusEl = document.getElementById("status");
+    const detailEl = document.getElementById("detail");
+
+    function setStatus(text, detail, variant) {
+      statusEl.textContent = text;
+      detailEl.textContent = detail;
+      dotEl.className = "dot" + (variant ? ` ${variant}` : "");
+      console.log(`[state] ${text}${detail ? " -- " + detail : ""}`);
+    }
+
+    let conversation = null;
+    let departureTimer = null;
+    // Temporary listeners a pending waitForFarewellToFinish() call is
+    // using to watch for the speaking -> not-speaking transition. Kept
+    // separate from the main onModeChange callback registered with the
+    // SDK, which only fires once per session.
+    let modeWatchers = [];
+
+    function handleModeChange(mode) {
+      if (conversation) {
+        setStatus(mode.mode === "speaking" ? "SPEAKING" : "LISTENING", "", "active");
+      }
+      for (const watcher of modeWatchers) watcher(mode);
+    }
+
+    // Resolves once a speaking turn has started and then ended, or after
+    // timeoutMs with no such transition. Mirrors reset_idle()/
+    // wait_until_idle() in elevenlabs_audio_interface.py: waiting for a
+    // *transition* rather than "not currently speaking" avoids resolving
+    // instantly against a stale idle state left over from before the cue
+    // was sent.
+    function waitForFarewellToFinish(timeoutMs) {
+      return new Promise((resolve) => {
+        let sawSpeaking = false;
+        let settled = false;
+
+        const timer = setTimeout(() => finish(false), timeoutMs);
+
+        function watcher(mode) {
+          if (mode.mode === "speaking") {
+            sawSpeaking = true;
+          } else if (sawSpeaking) {
+            finish(true);
+          }
+        }
+
+        function finish(result) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          modeWatchers = modeWatchers.filter((w) => w !== watcher);
+          resolve(result);
+        }
+
+        modeWatchers.push(watcher);
+      });
+    }
+
+    async function startConversation() {
+      setStatus("AWAKENING", "starting conversation");
+
+      try {
+        await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true },
+        });
+      } catch (err) {
+        console.error("[state] microphone permission denied", err);
+        setStatus("ERROR", "microphone permission denied", "error");
+        return;
+      }
+
+      try {
+        conversation = await Conversation.startSession({
+          agentId: AGENT_ID,
+          onConnect: () => setStatus("LISTENING", "conversation connected", "active"),
+          onDisconnect: () => {
+            console.log("[state] session ended");
+            conversation = null;
+            if (departureTimer) {
+              clearTimeout(departureTimer);
+              departureTimer = null;
+            }
+            setStatus("SLEEPING", "waiting for a visitor");
+          },
+          onError: (error) => {
+            console.error("[state] conversation error", error);
+          },
+          onModeChange: handleModeChange,
+        });
+      } catch (err) {
+        console.error("[state] failed to start session", err);
+        conversation = null;
+        setStatus("SLEEPING", "waiting for a visitor");
+      }
+    }
+
+    async function handleDeparture() {
+      departureTimer = null;
+      if (!conversation) return;
+
+      setStatus("DEPARTING", "saying goodbye", "active");
+      const farewellFinished = waitForFarewellToFinish(FAREWELL_TIMEOUT_MS);
+
+      try {
+        conversation.sendUserMessage(DEPARTURE_CUE);
+      } catch (err) {
+        console.error("[state] failed to send departure cue", err);
+      }
+
+      if (!(await farewellFinished)) {
+        console.warn("[state] timed out waiting for farewell to finish playing");
+      }
+
+      if (conversation) {
+        await conversation.endSession();
+      }
+      // onDisconnect (above) resets status back to SLEEPING.
+    }
+
+    // The presence sensor is a USB device that emulates a keyboard --
+    // identical semantics to KeystrokePresenceSensor in presence_sensor.py:
+    // 't' (talk) means someone is close enough to start a conversation,
+    // 'q' (quit) means they've left, 'r' (recognize) is noticed but not
+    // acted on. Requires this tab to stay focused -- unlike the native
+    // version's global pynput listener, a page can only see keystrokes
+    // while it's the focused window.
+    function onKeyDown(event) {
+      if (event.key === "t") {
+        console.log("[sensor] talk (t): presence -> true");
+        if (departureTimer) {
+          clearTimeout(departureTimer);
+          departureTimer = null;
+        }
+        if (!conversation) {
+          startConversation();
+        }
+      } else if (event.key === "q") {
+        console.log("[sensor] quit (q): presence -> false");
+        if (conversation && !departureTimer) {
+          departureTimer = setTimeout(handleDeparture, DEPARTURE_GRACE_MS);
+        }
+      } else if (event.key === "r") {
+        console.log("[sensor] recognize (r): noticed, not yet acted on");
+      }
+    }
+
+    document.addEventListener("keydown", onKeyDown);
+
+    // Keep the display awake for unattended, possibly hours-long booth
+    // operation. Best-effort: not every browser supports it, and it's
+    // released whenever the tab is hidden, so re-acquire on return.
+    async function keepAwake() {
+      if (!("wakeLock" in navigator)) return;
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        document.addEventListener("visibilitychange", async () => {
+          if (document.visibilityState === "visible") {
+            try {
+              await navigator.wakeLock.request("screen");
+            } catch (err) {
+              console.warn("[state] could not reacquire wake lock", err);
+            }
+          }
+        });
+        lock.addEventListener("release", () => {
+          console.log("[state] wake lock released");
+        });
+      } catch (err) {
+        console.warn("[state] wake lock unavailable", err);
+      }
+    }
+    keepAwake();
+
+    setStatus("SLEEPING", "waiting for a visitor");
+  </script>
+</body>
+</html>
